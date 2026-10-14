@@ -17,6 +17,7 @@ import math
 import random
 import sys
 from collections import Counter, defaultdict
+from decimal import ROUND_FLOOR, Decimal
 from statistics import NormalDist
 
 EPS = 1e-9   # kev EPSILON: p is clipped to [EPS, 1 - EPS] before a logit or a log
@@ -45,6 +46,11 @@ def softplus(x):
 
 def probit(p):
     return ND.inv_cdf(clip(p))
+
+
+def zval(p):
+    """z = Phi^-1(p) as the z gate and the reliability table show it, clipped at 1e-15 on both sides."""
+    return ND.inv_cdf(min(max(p, 1e-15), 1 - 1e-15))
 
 
 def log_phi(u):
@@ -80,7 +86,6 @@ def read_rows(path):
     if not rows:
         raise ValueError("no rows")
     return rows
-
 
 
 def brier(ps, ys):
@@ -129,17 +134,21 @@ def scores(ps, ys, k, mode):
             "mean_p": sum(ps) / len(ps), "rate": sum(ys) / len(ys)}
 
 
+LOSS_LO, LOSS_HI = -math.log(1 - EPS), -math.log(EPS)
+
 
 def fit_temperature(ps, ys, link="logit"):
-    """kev fit_temperature for the binary case: the grid point with the lowest mean log-loss. Identical (logit, outcome)
-    pairs are counted once with a weight, which changes nothing but the run time."""
+    """kev fit_temperature for the binary case: the grid point with the lowest mean log-loss. The loss is the one
+    logloss() reports, the tempered p clipped to [EPS, 1 - EPS], so the chosen T is the grid minimum of the printed
+    number. Identical (logit, outcome) pairs are counted once with a weight, which changes nothing but the run time."""
     to = logit if link == "logit" else probit
     pairs = Counter((to(p), y) for p, y in zip(ps, ys))
     total = sum(pairs.values())
     if link == "logit":
-        loss = lambda t: sum(c * softplus(-l / t if y else l / t) for (l, y), c in pairs.items())
+        one = lambda x, y: softplus(-x if y else x)
     else:
-        loss = lambda t: -sum(c * log_phi(x / t if y else -x / t) for (x, y), c in pairs.items())
+        one = lambda x, y: -log_phi(x if y else -x)
+    loss = lambda t: sum(c * min(max(one(v / t, y), LOSS_LO), LOSS_HI) for (v, y), c in pairs.items())
     losses = [loss(t) / total for t in T_GRID]
     return T_GRID[losses.index(min(losses))]
 
@@ -166,7 +175,6 @@ def out_of_fold(ps, ys, days, k, seed, link="logit"):
             if fold[d] == f:
                 cal[i] = temper(ps[i], t, link)
     return cal, temps, fold
-
 
 
 def quantile(values, q):
@@ -212,7 +220,6 @@ def paired_delta(days, ys, cand, ref, samples, seed):
     return out
 
 
-
 def gate_values(ps, gate, t=1.0, link="logit"):
     """Confidence on the scale the live gate compares: p itself, z = Phi^-1(p) when p came from Phi(z), or p after the
     temperature. A binary forecast predicts outcome 1 when p >= 0.5, so its confidence is max(p, 1 - p)."""
@@ -220,7 +227,7 @@ def gate_values(ps, gate, t=1.0, link="logit"):
     if gate == "calibrated":
         return [temper(c, t, link) for c in conf]
     if gate == "z":
-        return [ND.inv_cdf(min(c, 1 - 1e-15)) for c in conf]
+        return [zval(c) for c in conf]
     return conf
 
 
@@ -241,47 +248,70 @@ def select_cut(values, correct, budget, conservative=True):
     return best
 
 
+def cut_text(cut, values, places):
+    """The cut rounded down to `places` decimals, with more decimals only when the rounded number would also admit
+    the next value below the cut. The printed number then accepts exactly the rows the exact cut accepts: rounding
+    to nearest can admit rows just below the cut or drop the ones sitting on it."""
+    if cut is None:
+        return None
+    below = max((v for v in values if v < cut), default=-math.inf)
+    exact = Decimal(repr(cut))
+    for n in range(places, 18):
+        x = exact.quantize(Decimal(1).scaleb(-n), rounding=ROUND_FLOOR)
+        if below < float(x) <= cut:
+            return str(x)
+    return repr(cut)
+
+
 def cut_report(ps, ys, days, budget, gate, link, t_all, fold, temps, samples, seed, forward_days):
     correct = [(p >= 0.5) == bool(y) for p, y in zip(ps, ys)]
     wrong = [0.0 if c else 1.0 for c in correct]
 
     def held_out(train_idx, test_idx, t):
-        cut = select_cut(gate_values([ps[i] for i in train_idx], gate, t, link), [correct[i] for i in train_idx], budget)
+        train_vals = gate_values([ps[i] for i in train_idx], gate, t, link)
+        cut = select_cut(train_vals, [correct[i] for i in train_idx], budget)
+        text = cut_text(cut, train_vals, places)
         vals = gate_values([ps[i] for i in test_idx], gate, t, link)
-        acc = [1.0 if cut is not None and v >= cut else 0.0 for v in vals]
-        return cut, acc
+        acc = [1.0 if text is not None and v >= float(text) else 0.0 for v in vals]   # judge the printed number
+        return cut, text, acc
 
-    def judged(acc, idx, cut=None):
+    def judged(acc, idx, cut=None, text=None):
         errs = [acc[j] * wrong[i] for j, i in enumerate(idx)]
-        return {"cut": cut, "accepted": int(sum(acc)), "errors": int(sum(errs)), "coverage": sum(acc) / len(acc),
+        return {"cut": cut, "cut_text": text, "accepted": int(sum(acc)), "errors": int(sum(errs)), "coverage": sum(acc) / len(acc),
+                "accepted_days": len({days[i] for j, i in enumerate(idx) if acc[j]}),
                 "error": day_bootstrap([days[i] for i in idx], errs, acc, samples, seed)}
 
+    places = 3 if gate == "z" else 5
     values = gate_values(ps, gate, t_all, link)
     cut = select_cut(values, correct, budget)
     every = range(len(ps))
-    out = {"budget": budget, "gate": gate, **judged([1.0 if cut is not None and v >= cut else 0.0 for v in values], every, cut)}
+    two_sided = any(p < 0.5 for p in ps)
+    label = {"p": "max(p, 1-p)" if two_sided else "p", "z": "|z|" if two_sided else "z",
+             "calibrated": "calibrated max(p, 1-p)" if two_sided else "calibrated p"}[gate]
+    out = {"budget": budget, "gate": gate, "label": label,
+           **judged([1.0 if cut is not None and v >= cut else 0.0 for v in values], every, cut, cut_text(cut, values, places))}
 
     # out-of-fold: each fold's cut is fitted on the other folds' days (and their temperature) and judged on its own
     k = len(temps)
-    acc_oof, cuts = [0.0] * len(ps), []
+    acc_oof, cuts, texts = [0.0] * len(ps), [], []
     for f in range(k):
         train = [i for i, d in enumerate(days) if fold[d] != f]
         test = [i for i, d in enumerate(days) if fold[d] == f]
-        c, a = held_out(train, test, temps[f])
+        c, text, a = held_out(train, test, temps[f])
         cuts.append(c)
+        texts.append(text)
         for i, v in zip(test, a):
             acc_oof[i] = v
-    out["oof"] = {"cuts": cuts, **judged(acc_oof, every)}
+    out["oof"] = {"cuts": cuts, "cut_texts": texts, **judged(acc_oof, every)}
 
     if forward_days:
         first, last = forward_days
         train = [i for i, d in enumerate(days) if d in first]
         test = [i for i, d in enumerate(days) if d in last]
         t_fwd = fit_temperature([ps[i] for i in train], [ys[i] for i in train], link)
-        c, a = held_out(train, test, t_fwd)
-        out["forward"] = judged(a, test, c)
+        c, text, a = held_out(train, test, t_fwd)
+        out["forward"] = judged(a, test, c, text)
     return out
-
 
 
 def audit(rows, budget=0.05, gate="p", folds=5, samples=2000, seed=0, bins=10, bin_mode="mass", link="logit"):
@@ -330,7 +360,6 @@ def warnings(rep, ys, days):
     return w
 
 
-
 def _ci(b, fmt="{:+.4f}"):
     if b["value"] is None:
         return "n/a"
@@ -339,19 +368,21 @@ def _ci(b, fmt="{:+.4f}"):
 
 
 def _err(r):
-    """Error among accepted rows with its day interval. With no errors every resample is 0 and the interval collapses,
-    so the rule of three (3/n, about 95% one-sided for independent rows) stands in for it."""
+    """Error among accepted rows with its day interval. With no errors every resample is 0 and the interval collapses.
+    The rule of three then gives two different 95% bounds: on the share of ROWS with an error if rows are independent,
+    and on the share of DAYS with any error if days are independent. With correlated rows only the second holds, and
+    it bounds days, not rows: one big day can carry most of the row risk."""
     if r["accepted"] == 0:
         return "nothing accepted"
     if r["errors"] == 0:
-        return f"0 of {r['accepted']} (upper bound about {3 / r['accepted']:.2%} by the rule of three)"
+        return (f"0 of {r['accepted']} on {r['accepted_days']} days (no interval; rule of three: under "
+                f"{3 / r['accepted']:.2%} of rows if rows are independent, under {min(1, 3 / r['accepted_days']):.2%} "
+                f"of days if days are)")
     return f"{r['errors']} of {r['accepted']} = {_ci(r['error'], '{:.2%}')}"
 
 
-def _cut(c, gate):
-    if c is None:
-        return "none holds the budget"
-    return f"z >= {c:.3f}" if gate == "z" else f"{'calibrated p' if gate == 'calibrated' else 'p'} >= {c:.5f}"
+def _cut(r, label):
+    return "none holds the budget" if r["cut_text"] is None else f"{label} >= {r['cut_text']}"
 
 
 def format_report(rep):
@@ -377,16 +408,16 @@ def format_report(rep):
     lines += ["", f"reliability, raw p, {rep['bins']} {'equal-mass' if rep['bin_mode'] == 'mass' else 'equal-width'} bins",
               f"{'n':>7}  {scale + ' range':>19}{'mean p':>9}{'hit rate':>10}{'gap':>9}"]
     for r in rep["reliability"]:
-        lo, hi = (r["lo"], r["hi"]) if scale == "p" else (ND.inv_cdf(min(max(r["lo"], 0.5), 1 - 1e-15)), ND.inv_cdf(min(r["hi"], 1 - 1e-15)))
+        lo, hi = (r["lo"], r["hi"]) if scale == "p" else (zval(r["lo"]), zval(r["hi"]))
         rng = f"{lo:.4f}..{hi:.4f}" if scale == "p" else f"{lo:.3f}..{hi:.3f}"
         lines.append(f"{r['n']:7d}  {rng:>19}{r['mean_p']:9.4f}{r['rate']:10.4f}{r['rate'] - r['mean_p']:+9.4f}")
     c = rep["cut"]
-    lines += ["", f"error budget {c['budget']:.1%}, cut on the gate's own scale ({c['gate']}), conservative +1 rule",
-              f"  fitted on all days: {_cut(c['cut'], c['gate'])}: accepts {c['coverage']:.1%} of rows, errors {_err(c)}",
+    lines += ["", f"error budget {c['budget']:.1%}, cut on the gate's own scale ({c['label']}), conservative +1 rule",
+              f"  fitted on all days: {_cut(c, c['label'])}: accepts {c['coverage']:.1%} of rows, errors {_err(c)}",
               f"  out-of-fold (cut fitted on the other days): accepts {c['oof']['coverage']:.1%}, errors {_err(c['oof'])}"
-              f"; fold cuts " + ", ".join("none" if x is None else (f"{x:.3f}" if c["gate"] == "z" else f"{x:.5f}") for x in c["oof"]["cuts"])]
+              f"; fold cuts " + ", ".join("none" if x is None else x for x in c["oof"]["cut_texts"])]
     if "forward" in c:
-        lines.append(f"  forward (fitted on the first days, judged on the last): {_cut(c['forward']['cut'], c['gate'])}: "
+        lines.append(f"  forward (fitted on the first days, judged on the last): {_cut(c['forward'], c['label'])}: "
                      f"accepts {c['forward']['coverage']:.1%}, errors {_err(c['forward'])}")
     if rep["warnings"]:
         lines += [""] + [f"warning: {x}" for x in rep["warnings"]]

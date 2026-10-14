@@ -88,6 +88,16 @@ class Temperature(unittest.TestCase):
         rep = ca.audit(synth(1.5, link="probit", lo=0.6, hi=0.999), samples=200, link="probit")
         self.assertTrue(1.3 <= rep["temperature"] <= 1.75, rep["temperature"])
 
+    def test_fit_minimises_the_reported_logloss(self):
+        # a p = 1 row that loses: the fit must pick the grid point with the lowest PRINTED log-loss
+        rows = [(0.9, 1, f"d{d}") for d in range(6) for _ in range(100)] + [(1.0, 0, f"d{d}") for d in range(6)]
+        ps, ys = [r[0] for r in rows], [r[1] for r in rows]
+        for link in ca.LINKS:
+            t = ca.fit_temperature(ps, ys, link)
+            best = min(ca.T_GRID, key=lambda g: ca.logloss([ca.temper(p, g, link) for p in ps], ys))
+            self.assertAlmostEqual(ca.logloss([ca.temper(p, t, link) for p in ps], ys),
+                                   ca.logloss([ca.temper(p, best, link) for p in ps], ys), places=9)
+
     def test_temper_identity_and_direction(self):
         for link in ca.LINKS:
             self.assertAlmostEqual(ca.temper(0.9, 1.0, link), 0.9, places=9)
@@ -150,10 +160,48 @@ class Cut(unittest.TestCase):
     def test_plain_cut_goes_lower(self):
         self.assertEqual(ca.select_cut(self.values, self.correct, 0.06, conservative=False), 0.95)
 
-    def test_zero_errors_report_the_rule_of_three(self):
-        line = ca._err({"accepted": 150, "errors": 0, "error": {"value": 0.0, "ci95": [0.0, 0.0]}})
-        self.assertIn("2.00%", line)
+    def test_zero_errors_report_the_rule_of_three_both_ways(self):
+        # 100 identical rows a day add no evidence once the day moves as one: both readings must be printed
+        line = ca._err({"accepted": 2000, "accepted_days": 20, "errors": 0, "error": {"value": 0.0, "ci95": [0.0, 0.0]}})
+        self.assertIn("0.15% of rows", line)
+        self.assertIn("15.00% of days", line)
         self.assertNotIn("[0.00%", line)
+        many = ca._err({"accepted": 1000, "accepted_days": 1000, "errors": 0, "error": {"value": 0.0, "ci95": [0.0, 0.0]}})
+        self.assertIn("0.30% of days", many)
+
+    def test_printed_cut_keeps_the_accepted_set(self):
+        values = [0.990004] * 20 + [0.990003] * 20
+        correct = [True] * 20 + [False] * 20
+        cut = ca.select_cut(values, correct, 0.05)
+        text = ca.cut_text(cut, values, 5)
+        self.assertEqual(sum(v >= float(text) for v in values), 20, text)
+        z = [ca.ND.inv_cdf(0.97)] * 20
+        ztext = ca.cut_text(ca.select_cut(z, [True] * 20, 0.05), z, 3)
+        self.assertEqual(sum(v >= float(ztext) for v in z), 20, ztext)
+        self.assertEqual(ztext, "1.880")
+
+    def test_held_out_days_judge_the_printed_cut(self):
+        # forward train days hold 0.990004 (right), test days 0.990002 (wrong): a cut printed as 0.99000 would admit
+        # every test row, so the test rows must be judged against the printed number, not the exact one
+        rows = [(0.990004, 1, f"d{d:02d}") for d in range(20)] + [(0.990002, 0, f"d{d:02d}") for d in range(20, 30)]
+        fwd = ca.audit(rows, samples=50)["cut"]["forward"]
+        self.assertEqual(fwd["accepted"], sum(0.990002 >= float(fwd["cut_text"]) for _ in range(10)))
+
+    def test_json_cuts_stay_numbers(self):
+        cut = ca.audit([(0.99, 1, f"d{d:02d}") for d in range(30)], samples=50)["cut"]
+        self.assertTrue(all(isinstance(c, float) for c in cut["oof"]["cuts"]), cut["oof"]["cuts"])
+        self.assertTrue(all(isinstance(c, str) for c in cut["oof"]["cut_texts"]))
+
+    def test_z_table_and_gate_share_one_clip(self):
+        self.assertAlmostEqual(ca.zval(1 - 1e-12), ca.gate_values([1 - 1e-12], "z")[0])
+        self.assertGreater(ca.zval(1 - 1e-12), 7)
+
+    def test_label_names_the_confidence_when_p_falls_below_half(self):
+        rows = [(0.01, 0, f"d{d:02d}") for d in range(20)]
+        cut = ca.audit(rows, samples=50)["cut"]
+        self.assertEqual(cut["label"], "max(p, 1-p)")
+        self.assertEqual(cut["accepted"], 20)
+        self.assertEqual(ca.audit([(0.9, 1, f"d{d:02d}") for d in range(20)], samples=50)["cut"]["label"], "p")
 
     def test_impossible_budget(self):
         self.assertIsNone(ca.select_cut(self.values, self.correct, 0.001))
@@ -215,6 +263,15 @@ class Cli(unittest.TestCase):
         rep = json.loads(Path(out).read_text())
         self.assertEqual(rep["n"], 600)
         self.assertEqual(len(rep["reliability"]), 10)
+
+    def test_gate_z_renders_zero_and_low_p(self):
+        rows = [(p, int(p >= 0.5), f"2026-01-{d + 1:02d}") for d in range(8) for p in (0.0, 0.1, 0.7, 0.95, 1.0)]
+        r = self.run_cli(self.write(rows), "--gate", "z", "--samples", "50")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        ranges = [line.split()[1] for line in r.stdout.splitlines() if ".." in line and line.strip()[0].isdigit()]
+        for rng in ranges:
+            lo, hi = (float(x) for x in rng.split(".."))
+            self.assertLessEqual(lo, hi, rng)
 
     def test_bad_inputs_exit_2(self):
         cases = [self.write([(0.9, 1, "d1")], header=("p", "y", "day")), self.write([(1.2, 1, "d1")]),
