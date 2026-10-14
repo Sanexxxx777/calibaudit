@@ -1,0 +1,24 @@
+calibaudit
+Copyright 2026 Aleksandr Shulgin
+
+This product includes code derived from two Apache-2.0 projects.
+
+kev (https://github.com/jaredpalmer/kev)
+Copyright 2026 Jared Palmer
+Licensed under the Apache License, Version 2.0.
+Ported from kev/metrics.py and kev/calibrate.py at commit 0a6d3fafeee7: the temperature fit (lowest mean
+log-loss over 121 log-spaced points on 0.25..4), the group-disjoint out-of-fold temperature, the clustered
+paired percentile bootstrap, and the selective-prediction cut (the lowest threshold whose accepted set keeps
+the error within a budget).
+
+laya (https://github.com/NandhaKishorM/laya)
+Copyright NandhaKishorM and the laya contributors
+Licensed under the Apache License, Version 2.0.
+Ported from laya/calibrate.py at commit 432312b36714: _select_abstention_threshold (one pseudo-error added
+so a short clean run does not clear the gate, ties judged as a whole) and the rule that a cut is fitted on
+the scale the gate compares.
+
+Changes made in calibaudit: rewritten for binary forecasts in the Python standard library (no numpy);
+clusters are days; equal-mass reliability bins by default; an optional probit link; a forward split
+(fit on the first two thirds of the days, judge on the rest); the bootstrap runs on per-day sums; a
+rule-of-three bound replaces the interval when no errors are observed.
